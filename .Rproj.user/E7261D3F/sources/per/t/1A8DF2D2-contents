@@ -1,0 +1,545 @@
+---
+title: "tcga_brca1_clinical_analysis"
+output:
+  pdf_document: default
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+## R Markdown
+```{r}
+library(dplyr)
+library(scales)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(gtsummary)
+library(janitor)
+library(jsonlite)
+library(readxl)
+```
+
+```{r gets data frame and outpots age at diagnosis histogram}
+age_histogram<-function(x){
+  a<-ggplot(filter(clinical_tcga,G==x), aes(x=age_at_diagnosis_years)) +
+    geom_histogram(aes(y=2*(..density..)/sum(..density..)), breaks=seq(15,100,5), alpha=0.3, 
+                   position="identity", lwd=0.2) +
+    xlab(paste(" age at diagnosis" ,'"years"'))+
+    ylab("percentage")
+  a +ggtitle(x)
+}
+```
+
+
+```{r gets data frame and outpots age at diagnosis density}
+age_density<-function(x){
+  a<-ggplot(filter(clinical_tcga,G==x), aes(x=age_at_diagnosis_years)) +
+    geom_density(aes(y=2*(..density..)/sum(..density..)), breaks=seq(15,100,5), alpha=0.3, 
+                   position="identity", lwd=0.2) +
+    xlab(paste(" age at diagnosis" ,'"years"'))+
+    ylab("percentage")
+  a +ggtitle(x)
+}
+```
+
+
+```{r main function, runs tukey-HSD test for four groups}
+# for this function needs to be supplied clinical data and expression table 
+# function merges between clinical and expression table and start running tukey-HSD test per each gene per group index
+tukey_hsd_runner <- function(Clinical,Expression){
+  z.clinical_and_expression<-merge(Clinical[,c("case_submitter_id","G")],Expression, by.x ="case_submitter_id", by.y = 0) #merges data table with clinical table
+  z.clinical_and_expression[,-(1:2)]<-(scale(z.clinical_and_expression[,-(1:2)])) #scaling data frame by coulmn where column is gene 
+  z.clinical_and_expression<-as.data.frame(z.clinical_and_expression) #make scaled data a dataframe type
+  z.clinical_and_expression<-z.clinical_and_expression[, colSums(is.na(z.clinical_and_expression)) != nrow(z.clinical_and_expression)] #drops missing rows
+  z.AllGenesExpression <-as.vector(colnames(z.clinical_and_expression)) #make a vector for all the genes will use as an index for the loop
+  z.AllGenesExpression<-z.AllGenesExpression[-(1:2)] #drop patient column and groups column
+  ano_t<-aov(z.clinical_and_expression[,z.AllGenesExpression[1]]~z.clinical_and_expression$G) # do a prior anova test to get num of comparisons 
+  tukey_t<-TukeyHSD(ano_t)$`z.clinical_and_expression$G`[,"p adj"] 
+  num_of_comp <- length(names(tukey_t)) # names of the number of comparison
+  z.Pcounter <- data.frame(Gene = z.AllGenesExpression, Pvalue = rep(0,length(z.AllGenesExpression))) # data table for p_values anova
+  #loops for each gene make a Tukey-HSD test and ANOVA between the 4 groups 
+  #generates a table with p-value for each comparison 
+  z.Tukey_counter <- data.frame(matrix(ncol = num_of_comp+2, nrow = 0)) #data for tukeyHsd comparison 
+  nam <- c("Gene" , "Pvalue" , 
+         names(tukey_t))
+  colnames(z.Tukey_counter)<-nam
+  for (i in z.AllGenesExpression) {
+    ano<-aov(z.clinical_and_expression[,i]~z.clinical_and_expression$G)
+    p<-summary(ano)[[1]][[1,"Pr(>F)"]]
+    z.Pcounter$Pvalue[z.Pcounter$Gene==i]<-p
+    x<-TukeyHSD(ano)$`z.clinical_and_expression$G`[,"p adj"]
+    z.Tukey_counter<-rbind(z.Tukey_counter,c(i,p,x))
+  }
+  colnames(z.Tukey_counter)<-nam
+  rownames(z.Tukey_counter)<-z.Tukey_counter$Gene
+  z.Tukey_counter[,2:(num_of_comp+2)]<-data.frame(sapply(z.Tukey_counter[,2:(num_of_comp+2)], function(x) as.numeric(as.character(x))))
+  return(z.Tukey_counter)
+}
+
+```
+
+```{r}
+# function gets age and clinical table 
+# function outputs table with extra column that index patients to four different groups 
+# four groups are age: under/over BRCA1:has mutation/doesn't have mutation
+set_age_cutoff <-function(x,clinical){
+clinical<-mutate(clinical, Age_thershold = ifelse(age_at_diagnosis_years >= x, "late_on_set","early_on_set"))
+clinical<-mutate(clinical_tcga ,G = ifelse(clinical$Age_thershold == "late_on_set" & clinical$Is_brca1 == "BRCA1","Brca1_late_on_set", # has brac1 mutation and over 55
+                                        ifelse(clinical$Age_thershold == "early_on_set" & clinical$Is_brca1 == "BRCA1","Brca1_early_on_set", # has brac1 mutation and under 55
+                                              ifelse(clinical$Age_thershold == "late_on_set" & clinical$Is_brca1 == "WILD_TYPE","wild_type_late_on_set", 
+                                                  ifelse(clinical$Age_thershold == "early_on_set" & clinical$Is_brca1 == "WILD_TYPE","wild_type_early_on_set","")))))
+}
+```
+
+```{r this function gets results for tukey-HSD results and outputs for each gene if it was significant in one or more of the tukey-HSD tests}
+# function gets three data frames of tukey-HSD results and a p-value 
+# function outputs new table with same dimensions as results that index significant genes if they were significant in first result or second or both 
+sig_combind_genes<-function (df1,df2,df3,p) {
+nam <- colnames(df1)
+if(length(nam)>3){
+df <- data.frame(matrix(ncol = length(colnames(df1)), nrow = length(rownames(df1))))
+colnames(df) <- nam
+df$Gene <- df1$Gene
+rownames(df)<-df1$Gene
+for(j in nam[-1]){
+  for(i in df1$Gene){
+    if((df1[i,j] < p) && (df2[i,j] < p) && (df3[i,j]<p)){
+      df[i,j] <- "shared genes for all tests"
+    }else if((df1[i,j] < p) && (df2[i,j] < p) &&(df3[i,j]<p)==F){
+      df[i,j] <- "shared genes for two tests"
+    }else if((df1[i,j] < p) && (df2[i,j] < p)==F &&(df3[i,j]<p)){
+      df[i,j] <- "shared genes for two tests"
+    }else if((df1[i,j] < p)==F && (df2[i,j] < p) &&(df3[i,j]<p)){
+      df[i,j] <- "shared genes for two tests"
+    }else if ((df1[i,j] < p)  && (df2[i,j] < p)== F && (df3[i,j] < p)==F){
+      df[i,j] <- deparse(substitute(df1))
+    }else if ((df1[i,j] < p)== F  && (df2[i,j] < p) && (df3[i,j] < p)==F){
+      df[i,j] <- deparse(substitute(df2))
+    }else if ((df1[i,j] < p)== F  && (df2[i,j] < p)==F && (df3[i,j] < p)){
+      df[i,j] <- deparse(substitute(df3))
+    }
+  }
+}
+}
+else{
+  df <- data.frame(matrix(ncol = length(colnames(df1)[1:2]), nrow = length(rownames(df1))))
+  colnames(df) <- nam[1:2]
+  df$Gene <- df1$Gene
+  rownames(df)<-df1$Gene
+  for(j in nam[2]){
+  for(i in df1$Gene){
+    if((df1[i,j] < p) && (df2[i,j] < p) && (df3[i,j]<p)){
+      df[i,j] <- "shared genes for all tests"
+    }else if((df1[i,j] < p) && (df2[i,j] < p) &&(df3[i,j]<p)==F){
+      df[i,j] <- "shared genes for two tests"
+    }else if((df1[i,j] < p) && (df2[i,j] < p)==F &&(df3[i,j]<p)){
+      df[i,j] <- "shared genes for two tests"
+    }else if((df1[i,j] < p)==F && (df2[i,j] < p) &&(df3[i,j]<p)){
+      df[i,j] <- "shared genes for two tests"
+    }else if ((df1[i,j] < p)  && (df2[i,j] < p)== F && (df3[i,j] < p)==F){
+      df[i,j] <- deparse(substitute(df1))
+    }else if ((df1[i,j] < p)== F  && (df2[i,j] < p) && (df3[i,j] < p)==F){
+      df[i,j] <- deparse(substitute(df2))
+    }else if ((df1[i,j] < p)== F  && (df2[i,j] < p)==F && (df3[i,j] < p)){
+      df[i,j] <- deparse(substitute(df3))
+    }
+  }
+}
+}
+return(df)
+}
+```
+
+
+```{r this function prepers data for Kaplan Meier analysis}
+kaplan_meier_data_manipulation<-function(df){
+## manipulate survival status data 
+
+df$vital_status_binary <- ifelse(df$vital_status=="Alive",0,ifelse(df$vital_status=="Dead",1,""))
+df$vital_status_binary <- as.numeric(df$vital_status_binary)
+## manipulate time till event - lose missing data
+## make time as months 
+df<-filter(df,df$days_to_death!="'--")
+df$months_to_death<-as.numeric(df$days_to_death)
+df$months_to_death<-(as.numeric(df$days_to_death)/365)
+return(df)
+}
+## run KM manipulation
+```
+
+```{r this function makes a text into a file. one step before prepering an output text file}
+output_list_to_text<-function(x, fil){ z <- deparse(substitute(x))
+cat(z, "\n", file=fil)
+nams=names(x) 
+for (i in seq_along(x) ){ cat(nams[i], "\t",  x[[i]], "\n", 
+                              file=fil, append=TRUE) }
+}
+
+```
+
+load data 
+```{r load data }
+clinical_tcga<-as.data.frame(read.csv("/Users/feigin/Desktop/Tsarfary Lab/clinical_tcga/clinical_tcga_test/clinical.csv"))
+clinical_brca1<-as.data.frame(read.csv("/Users/feigin/Desktop/Tsarfary Lab/clinical_tcga/clinical_tcga_test/clinical_brca1.csv"))
+```
+to start the analysis data needs to be subseted from duplicates.
+only relevant columns will be selected in order to remove duplicated properly this is because patients appears in multiple rows and have irrelevant data 
+names of relevant colnames = 
+ "case_id"                
+ "case_submitter_id"   
+ "days_to_death"        
+ "vital_status"
+ "age_at_diagnosis"  
+ "days_to_last_follow_up"
+```{r}
+clinical_tcga <- select(clinical_tcga,c("case_id",                
+ "case_submitter_id",   
+ "days_to_death",        
+ "vital_status",
+ "age_at_diagnosis",  
+ "days_to_last_follow_up"))
+clinical_tcga <- distinct(clinical_tcga)
+clinical_tcga$days_to_death[clinical_tcga$days_to_death=="'--"] <- clinical_tcga$days_to_last_follow_up[clinical_tcga$days_to_death=="'--"]
+```
+add column indicting patient has mutation BRCA1 
+```{r}
+unique_brca1<-unique(clinical_brca1$case_id)
+clinical_tcga<-mutate(clinical_tcga, Is_brca1 = ifelse(clinical_tcga$case_id %in% clinical_brca1$case_id,"BRCA1","WILD_TYPE"))
+```
+keep valid age results
+```{r}
+clinical_tcga<-clinical_tcga %>% 
+  filter(age_at_diagnosis != "'--") %>%
+  mutate(age_at_diagnosis_years = as.numeric(age_at_diagnosis)/365)
+```
+
+```{r outputs density plot for two groups}
+dens<-ggplot(clinical_tcga,aes(x=age_at_diagnosis_years)) + 
+  geom_density(aes(fill = Is_brca1,position="identity"),alpha = 0.3) + 
+  xlab(paste(" age at diagnosis" ,'"years"')) 
+dens + 
+  labs(fill="population",caption = paste("N Brca1 =" ,length(clinical_tcga$case_id[clinical_tcga$Is_brca1=="BRCA1"]), 
+                                         "N WILD_TYPE =",length(clinical_tcga$case_id[clinical_tcga$Is_brca1=="WILD_TYPE"])))
+```
+
+```{r ## Histogram plot between BRCA1 and wildtype }
+Histogrm_p <- clinical_tcga %>%
+  ggplot( aes(x=age_at_diagnosis_years, fill=Is_brca1)) +
+  geom_histogram( color="#e9ecef", alpha=0.4, position = 'identity',bins = 15) +
+  xlab(paste(" age at diagnosis" ,'"years"')) +
+  labs(fill="population",caption = paste("N Brca1 =" ,length(clinical_tcga$case_id[clinical_tcga$Is_brca1=="BRCA1"]), "N Without=", length(clinical_tcga$case_id[clinical_tcga$Is_brca1=="WILD_TYPE"])))
+Histogrm_p
+```
+
+```{r ## Normalized Histogram plot between BRCA1 and wildtype }
+Normalized_p<-ggplot(clinical_tcga, aes(x=age_at_diagnosis_years, fill=Is_brca1)) +
+  geom_histogram(aes(y=2*(..density..)/sum(..density..)), breaks=seq(15,100,5), alpha=0.3, 
+                 position="identity", lwd=0.2) +
+  xlab(paste(" age at diagnosis" ,'"years"'))+
+  ylab("percentage")+
+  labs(fill="population",caption = paste("N Brca1 =" ,length(clinical_tcga$case_id[clinical_tcga$Is_brca1=="BRCA1"&!(is.na(clinical_tcga$age_at_diagnosis))]), 
+                                         "N Without=", length(clinical_tcga$case_id[clinical_tcga$Is_brca1=="WILD_TYPE" &!(is.na(clinical_tcga$age_at_diagnosis)) ])))
+  Normalized_p  +scale_y_continuous()
+```
+```{r}
+clinical_tcga <- set_age_cutoff(55,clinical_tcga)
+```
+
+```{r}
+## Normalized Density plot between BRCA1 and wildtype early/late on_set
+Normalized_p<-ggplot(clinical_tcga, aes(x=age_at_diagnosis_years, fill=G)) +
+  geom_density(aes(y=2*(..density..)/sum(..density..)), breaks=seq(15,100,5), alpha=0.3, 
+                 position="identity", lwd=0.2) +
+  xlab(paste(" age at diagnosis" ,'"years"'))+
+  ylab("percentage")+
+  labs(fill="population",caption = paste("N Brca1 late on set =" ,length(clinical_tcga$case_id[clinical_tcga$G=="Brca1_late_on_set"&!(is.na(clinical_tcga$age_at_diagnosis))]),"\n", 
+                                         "N Brca1 early on set=", length(clinical_tcga$case_id[clinical_tcga$G=="Brca1_early_on_set" &!(is.na(clinical_tcga$age_at_diagnosis))]),"\n",
+                                         "N wild type late on set=", length(clinical_tcga$case_id[clinical_tcga$G=="wild_type_late_on_set" &!(is.na(clinical_tcga$age_at_diagnosis))]),"\n",
+                                         "N wild type early on set=", length(clinical_tcga$case_id[clinical_tcga$G=="wild_type_early_on_set" &!(is.na(clinical_tcga$age_at_diagnosis))])))
+Normalized_p+scale_y_continuous()
+```
+
+```{r}
+## Normalized Histogram plot between BRCA1 and wildtype early/late on_set
+Normalized_p_hist<-ggplot(clinical_tcga, aes(x=age_at_diagnosis_years, fill=G)) +
+  geom_histogram(aes(y=2*(..density..)/sum(..density..)), breaks=seq(15,100,5), alpha=0.3, 
+               position="identity", lwd=0.2) +
+  xlab(paste(" age at diagnosis" ,'"years"'))+
+  ylab("percentage")+
+  labs(fill="population",caption = paste("N Brca1 late on set =" ,length(clinical_tcga$case_id[clinical_tcga$G=="Brca1_late_on_set"&!(is.na(clinical_tcga$age_at_diagnosis))]),"\n", 
+                                         "N Brca1 early on set=", length(clinical_tcga$case_id[clinical_tcga$G=="Brca1_early_on_set" &!(is.na(clinical_tcga$age_at_diagnosis))]),"\n",
+                                         "N wild type late on set=", length(clinical_tcga$case_id[clinical_tcga$G=="wild_type_late_on_set" &!(is.na(clinical_tcga$age_at_diagnosis))]),"\n",
+                                         "N wild type early on set=", length(clinical_tcga$case_id[clinical_tcga$G=="wild_type_early_on_set" &!(is.na(clinical_tcga$age_at_diagnosis))])))
+Normalized_p_hist+scale_y_continuous()
+```
+##kaplan meier analysis
+##maniputlate data table for kaplan meiers
+
+```{r kaplan meier}
+clinical_tcga <- kaplan_meier_data_manipulation(clinical_tcga)
+```
+survival plot
+```{r}
+## plot kaplan meier per groups
+km_group <- survfit(Surv(months_to_death, vital_status_binary) ~ G , data=clinical_tcga)
+ggsurvplot(km_group,
+                 data = clinical_tcga,
+                 pval = TRUE, conf.int = F,
+           pval.method = T,
+           log.rank.weights = "1",
+           risk.table = TRUE, # Add risk table
+           risk.table.col = "strata", # Change risk table color by groups
+           linetype = "strata", # Change line type by groups
+           tables.y.text = T,
+           ggtheme = theme_bw(), # Change ggplot2 theme
+)
+```
+cox fit plot
+c("survdiff","1","n","sqrtN","S1","S2","FH_p=1_q=1")
+```{r}
+Cox_fit_group <- coxph(Surv(months_to_death, vital_status_binary) ~ G , data=clinical_tcga)
+ggforest(Cox_fit_group)
+```
+run kaplan Meier for brca1 and wild type individually 
+```{r}
+clinical_tcga_brca1_only <- filter(clinical_tcga, Is_brca1 == "BRCA1")
+clinical_tcga_brca1_only <- kaplan_meier_data_manipulation(clinical_tcga_brca1_only)
+clinical_tcga_WD_only <- filter(clinical_tcga,Is_brca1 == "WILD_TYPE")
+clinical_tcga_WD_only<- kaplan_meier_data_manipulation(clinical_tcga_WD_only)
+```
+kaplan meier plot only for brca1 patients 
+```{r}
+## plot kaplan meier per groups
+km_group_brca1 <- survfit(Surv(months_to_death, vital_status_binary) ~ G , data=clinical_tcga_brca1_only)
+ggsurvplot(km_group_brca1,
+                 data = clinical_tcga_brca1_only,
+                 pval = TRUE, conf.int = F,
+           pval.method = T,
+           risk.table = TRUE, # Add risk table
+           risk.table.col = "strata", # Change risk table color by groups
+           linetype = "strata", # Change line type by groups
+           tables.y.text =T, 
+           ggtheme = theme_bw(), # Change ggplot2 theme
+)
+```
+
+```{r}
+Cox_fit_group_brca1 <- coxph(Surv(months_to_death, vital_status_binary) ~ G , data=clinical_tcga_brca1_only)
+ggforest(Cox_fit_group_brca1)
+```
+
+```{r}
+## plot kaplan meier per groups
+km_group_WD <- survfit(Surv(months_to_death, vital_status_binary) ~ G , data=clinical_tcga_WD_only)
+ggsurvplot(km_group_WD,
+                 data = clinical_tcga_WD_only,
+                 pval = TRUE, conf.int = F,
+           pval.method = T,
+           risk.table = TRUE, # Add risk table
+           risk.table.col = "strata", # Change risk table color by groups
+           linetype = "strata", # Change line type by groups
+           tables.y.text = T,
+           ggtheme = theme_bw(), # Change ggplot2 theme
+)
+```
+
+
+```{r}
+Cox_fit_group_WD <- coxph(Surv(months_to_death, vital_status_binary) ~ G , data=clinical_tcga_WD_only)
+ggforest(Cox_fit_group_WD)
+```
+
+cumaltive plots not related to KM analysis
+over all population
+```{r }
+age_of_diagonsis_months<-as.numeric(clinical_tcga$age_at_diagnosis)/365
+h <- hist(
+  main = "cumulative graph over all population",
+  xlab = "age of diagnosis 'Years'",
+  age_of_diagonsis_months,
+  breaks = seq(0, 100, 1),
+  xlim = c(0,100))
+ec <- ecdf(age_of_diagonsis_months)
+lines(x = h$mids, y=ec(h$mids)*max(h$counts), col ='red')
+```
+brca1 patients
+```{r }
+#brca1 patients
+age_of_diagonsis_months_BRCA1<-as.numeric(clinical_tcga$age_at_diagnosis[clinical_tcga$Is_brca1=="BRCA1"])/365
+h <- hist(
+  main = "cumulative graph over BRCA1 population",
+  xlab = "age of diagnosis 'Years'",
+  age_of_diagonsis_months_BRCA1,
+  breaks = seq(0, 100, 1),
+  xlim = c(0,100))
+ec <- ecdf(age_of_diagonsis_months_BRCA1)
+lines(x = h$mids, y=ec(h$mids)*max(h$counts), col ='red')
+```
+
+```{r #wild_type pateints}
+
+age_of_diagonsis_months_Non_BRCA1<-as.numeric(clinical_tcga$age_at_diagnosis[clinical_tcga$Is_brca1=="Without BRCA1"])/365
+h <- hist(
+  main = 'cumulative graph over "Wild Type" population',
+  xlab = "age of diagnosis 'Years'",
+  age_of_diagonsis_months_BRCA1,
+  breaks = seq(0, 100, 1),
+  xlim = c(0,100))
+ec <- ecdf(age_of_diagonsis_months_BRCA1)
+lines(x = h$mids, y=ec(h$mids)*max(h$counts), col ='red')
+```
+#summary statistics 
+this plots summary statistics per group brca1/WD/late/early
+```{r}
+tbl_summary(select(clinical_tcga,c(G,age_at_diagnosis_years)),by = G,    type = all_continuous() ~ "continuous2",
+            statistic = all_continuous() ~ c("{N_nonmiss}","{mean}","{sd}",
+                                             "{median} ({p25}, {p75})", 
+                                             "{min}, {max}"))
+```
+raw data of tcga expression has genes for rows 
+19947 rows and 1226 columns (patients)
+this makes an expression table after subtracting duplicate values 
+after finishing manipulating data will be scaled 
+finished data needs to have 19672 unique genes and 1095 unique patients 
+rows will be patients and columns will display genes 
+
+```{r}
+expression_tcga<-as.data.frame(read.csv("/Users/feigin/Desktop/Tsarfary Lab/clinical_tcga/clinical_tcga_test/TCGA_BRCA.csv")) # set new data frame for manipulation
+expression_tcga<-expression_tcga %>% group_by(X) %>% summarise_all(mean) #averages genes and remove duplicates
+expression_tcga<- t(expression_tcga) #invert table so patient will be in rows 
+expression_tcga<-as.data.frame(expression_tcga) 
+expression_tcga<-row_to_names(expression_tcga,1) # set col name
+expression_tcga$patients<-rownames(expression_tcga) # make new col for patients to be grouped by when drooping duplicate patients
+expression_tcga$patients<-substr(expression_tcga$patients,1,12) #change patient name to only be for 1-12 first characters  
+expression_tcga$patients<-gsub('\\.',"-",expression_tcga$patients)
+col<-colnames(expression_tcga) #set index where data table would be inverted to numeric
+col<-col[1:19672] # only columns with genes inside 
+expression_tcga[col] <- sapply(expression_tcga[col],as.numeric) #invert data values to numeric 
+expression_tcga<-as.data.frame(expression_tcga)
+expression_tcga <- expression_tcga %>% group_by(patients) %>% summarise_all(mean) # group by patient names to avoid duplicates 
+expression_tcga <-as.data.frame(expression_tcga)
+rownames(expression_tcga)<-expression_tcga$patients #set row names to be patient name 
+c.expression_tcga<-expression_tcga[,-1] # drop patient column
+```
+
+```{r}
+clinical_tcga <- set_age_cutoff(45,clinical=clinical_tcga)
+results_for_age_45 <- tukey_hsd_runner(clinical_tcga,c.expression_tcga)
+```
+
+```{r}
+clinical_tcga <- set_age_cutoff(40,clinical=clinical_tcga)
+results_for_age_40 <- tukey_hsd_runner(clinical_tcga,c.expression_tcga)
+```
+
+```{r}
+clinical_tcga <- set_age_cutoff(30,clinical=clinical_tcga)
+results_for_age_30 <- tukey_hsd_runner(clinical_tcga,c.expression_tcga)
+```
+
+```{r}
+combined_genes <- sig_combind_genes(results_for_age_40,results_for_age_45,results_for_age_30, p = 0.0001)
+```
+
+```{r}
+clinical_tcga <- set_age_cutoff(45,clinical=clinical_tcga)
+clinical_tcga_brca1_only <- filter(clinical_tcga, Is_brca1 == "BRCA1")
+results_for_age_45_brca1_only <- tukey_hsd_runner(clinical_tcga_brca1_only,c.expression_tcga)
+clinical_tcga <- set_age_cutoff(40,clinical=clinical_tcga)
+clinical_tcga_brca1_only <- filter(clinical_tcga, Is_brca1 == "BRCA1")
+results_for_age_40_brca1_only <- tukey_hsd_runner(clinical_tcga_brca1_only,c.expression_tcga)
+clinical_tcga <- set_age_cutoff(30,clinical=clinical_tcga)
+clinical_tcga_brca1_only <- filter(clinical_tcga, Is_brca1 == "BRCA1")
+results_for_age_30_brca1_only <- tukey_hsd_runner(clinical_tcga_brca1_only,c.expression_tcga)
+```
+
+```{r}
+clinical_tcga <- set_age_cutoff(45,clinical=clinical_tcga)
+clinical_tcga_WD_only <- filter(clinical_tcga, Is_brca1 == "WILD_TYPE")
+results_for_age_45_WD_only <- tukey_hsd_runner(clinical_tcga_WD_only,c.expression_tcga)
+
+clinical_tcga <- set_age_cutoff(40,clinical=clinical_tcga)
+clinical_tcga_WD_only <- filter(clinical_tcga, Is_brca1 == "WILD_TYPE")
+results_for_age_40_WD_only <- tukey_hsd_runner(clinical_tcga_WD_only,c.expression_tcga)
+
+clinical_tcga <- set_age_cutoff(30,clinical=clinical_tcga)
+clinical_tcga_WD_only <- filter(clinical_tcga, Is_brca1 == "WILD_TYPE")
+results_for_age_30_WD_only <- tukey_hsd_runner(clinical_tcga_WD_only,c.expression_tcga)
+```
+
+```{r}
+combined_genes_brca_only <- sig_combind_genes(results_for_age_40_brca1_only,results_for_age_45_brca1_only,results_for_age_30_brca1_only, p = 0.0001)
+```
+
+```{r}
+combined_genes_WD_only <- sig_combind_genes(results_for_age_40_WD_only,results_for_age_45_WD_only,results_for_age_30_WD_only, p = 0.0001)
+```
+
+```{r}
+filt_combinde_genes <- combined_genes[,-1]
+filt_combinde_genes <- filt_combinde_genes %>% filter_all(any_vars(!is.na(.)))
+```
+
+```{r}
+filt_combinde_genes_brca1 <- combined_genes_brca_only
+filt_combinde_genes_brca1 <- filt_combinde_genes_brca1 %>% filter(!is.na(Pvalue))
+```
+
+```{r}
+filt_combinde_genes_WD <- combined_genes_WD_only
+filt_combinde_genes_WD <- filt_combinde_genes_WD %>% filter(!is.na(Pvalue))
+```
+
+```{r}
+list_of_genes<-list()
+for(i in colnames(filt_combinde_genes)){
+  a<-select(filt_combinde_genes,i)
+  a<-a %>%filter_all(any_vars(!is.na(.)))
+  b<-rownames(a)
+  list_of_genes[[i]]<-b
+}
+```
+
+```{r}
+list_of_genes_brca1<-list()
+for(i in colnames(filt_combinde_genes_brca1)){
+  a<-select(filt_combinde_genes_brca1,i)
+  a<-a %>%filter_all(any_vars(!is.na(.)))
+  b<-rownames(a)
+  list_of_genes_brca1[[i]]<-b
+}
+```
+
+```{r}
+list_of_genes_WD<-list()
+for(i in colnames(filt_combinde_genes_WD)){
+  a<-select(filt_combinde_genes_WD,i)
+  a<-a %>%filter_all(any_vars(!is.na(.)))
+  b<-rownames(a)
+  list_of_genes_WD[[i]]<-b
+}
+```
+
+```{r}
+ListJSON=toJSON(list_of_genes,pretty=TRUE,auto_unbox=TRUE)
+write(ListJSON, "combined_genes_40_45_0.0001.json")
+```
+
+```{r}
+output_list_to_text(list_of_genes,"combined_genes_ages_30_40_45.txt")
+```
+
+```{r}
+write.csv(filt_combinde_genes,"combined_genes_ages_30_40_45.csv")
+```
+```{r}
+write.csv(filt_combinde_genes_brca1,"combined_genes_ages_30_40_45_only_brca1.csv")
+write.csv(filt_combinde_genes_WD,"combined_genes_ages_30_40_45_only_WILD_TYPE.csv")
+```
+```{r}
+output_list_to_text(list_of_genes_brca1,"combined_genes_ages_30_40_45_only_brca1.txt")
+output_list_to_text(list_of_genes_WD,"combined_genes_ages_30_40_45_only_WD.txt")
+
+```
+
